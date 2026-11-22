@@ -1,64 +1,157 @@
-name: CI
+name: CI - Security Pipeline with DAST
 
-# triggers pipeline when push is made to any branch (typical CI pipeline rule)
-on: [push]
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: read
 
 jobs:
   sast_scan:
-    name: Run Bandit Scan
+    name: Run Bandit SAST Scan
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install Bandit
-      run: pip install bandit
+      - name: Install Bandit
+        run: python -m pip install --upgrade pip bandit
 
-    - name: Run Bandit Scan
-      # save report in json format
-      run: bandit -ll -ii -r . -f json -o bandit-report.json
+      - name: Run Bandit Scan
+        run: bandit -ll -ii -r . -f json -o bandit-report.json
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      if: always()
-      # execute this step no matter of previous status
-      with:
-        # how artifacts will be named when exported
-        name: bandit-findings
-        path: bandit-report.json
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-findings
+          path: bandit-report.json
+          if-no-files-found: warn
+          retention-days: 14
 
   image_scan:
-    # each new job runs in a new isolated environment
-    name: Build and Run Image Scan
+    name: Build and Scan Docker Image
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Build Docker Image
-      run: docker build -f Dockerfile -t mytestapp:latest .
+      - name: Build Docker image from repository
+        run: docker build --file Dockerfile --tag mytestapp:latest .
 
-    - name: Docker Scout Scan
-      uses: docker/scout-action@v1.15.1
-      with:
-        dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
-        dockerhub-password: ${{ secrets.DOCKERHUB_PASSWORD }}
-        command: quickview,cves
-        only-severities: critical,high
-        sarif-file: scout-report.sarif
-        # exit code by default is true which means 0, add true to produce non success
-        exit-code: true
+      - name: Docker Scout scan
+        uses: docker/scout-action@v1.15.1
+        with:
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          image: local://mytestapp:latest
+          command: quickview,cves
+          only-severities: critical,high
+          sarif-file: scout-report.sarif
+          exit-code: true
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: docker-scout-findings
-        path: scout-report.sarif
+      - name: Upload Docker Scout report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-scout-findings
+          path: scout-report.sarif
+          if-no-files-found: warn
+          retention-days: 14
+
+  dast_scan:
+    name: Build, Deploy PyGoat from Source, and Run OWASP ZAP
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and deploy PyGoat from this repository
+        run: docker compose up --build --detach
+
+      - name: Show Compose deployment status
+        run: docker compose ps
+
+      - name: Wait for PyGoat to become ready
+        shell: bash
+        run: |
+          for attempt in $(seq 1 36); do
+            if curl --fail --silent --show-error http://127.0.0.1:8000/ >/dev/null; then
+              echo "PyGoat built and deployed from this repository is responding on port 8000."
+              exit 0
+            fi
+            echo "Waiting for PyGoat startup ($attempt/36)..."
+            sleep 5
+          done
+          echo "PyGoat did not become ready. Compose logs:"
+          docker compose logs --no-color migration web || true
+          exit 1
+
+      - name: Run OWASP ZAP Baseline Scan
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/zap-reports"
+          docker run --rm --network host \
+            -v "${GITHUB_WORKSPACE}/zap-reports:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://127.0.0.1:8000 \
+              -m 3 \
+              -r /zap/wrk/zap-report.html \
+              -J /zap/wrk/zap-report.json \
+              -I
+
+      - name: Summarize ZAP findings in the job summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
+
+          report = Path("zap-reports/zap-report.json")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## OWASP ZAP DAST summary\n\n")
+              if not report.exists():
+                  summary.write("The ZAP JSON report was not created. Check the ZAP step and container logs.\n")
+                  raise SystemExit(0)
+
+              data = json.loads(report.read_text(encoding="utf-8"))
+              sites = data.get("site", [])
+              alerts = []
+              for site in sites if isinstance(sites, list) else []:
+                  alerts.extend(site.get("alerts", []))
+
+              counts = Counter(
+                  str(alert.get("riskdesc", "Unknown")).split(" (", 1)[0]
+                  for alert in alerts
+              )
+              summary.write(f"- Sites scanned: **{len(sites)}**\n")
+              summary.write(f"- Alert types: **{len(alerts)}**\n")
+              summary.write(f"- Alert instances: **{sum(len(a.get('instances', [])) for a in alerts)}**\n\n")
+              summary.write("| Risk | Alert types |\n|---|---:|\n")
+              for risk in ("Critical", "High", "Medium", "Low", "Informational", "Unknown"):
+                  if counts.get(risk):
+                      summary.write(f"| {risk} | {counts[risk]} |\n")
+              if not alerts:
+                  summary.write("No alerts were listed in the ZAP JSON report.\n")
+          PY
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-dast-reports
+          path: zap-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stop the PyGoat Compose stack
+        if: always()
+        run: docker compose down --volumes --remove-orphans || true
