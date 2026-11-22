@@ -93,10 +93,23 @@ jobs:
           exit 1
 
       - name: Run OWASP ZAP Baseline Scan
+        shell: bash
         run: |
+          # Avoid bind-mount permission problems in /zap/wrk. ZAP writes its
+          # plan and reports to the container's own writable filesystem;
+          # docker cp exports the finished reports to the GitHub workspace.
+          set -euo pipefail
           mkdir -p "${GITHUB_WORKSPACE}/zap-reports"
-          docker run --rm --network host \
-            -v "${GITHUB_WORKSPACE}/zap-reports:/zap/wrk/:rw" \
+
+          ZAP_CONTAINER="zap-dast-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f "$ZAP_CONTAINER" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker create \
+            --name "$ZAP_CONTAINER" \
+            --network host \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py \
               -t http://127.0.0.1:8000 \
@@ -104,8 +117,25 @@ jobs:
               -r zap-report.html \
               -J zap-report.json \
               -I
+
+          set +e
+          docker start --attach "$ZAP_CONTAINER"
+          ZAP_EXIT_CODE=$?
+          set -e
+
+          echo "ZAP container exit code: ${ZAP_EXIT_CODE}"
+          docker cp "$ZAP_CONTAINER:/zap/wrk/zap-report.html" \
+            "${GITHUB_WORKSPACE}/zap-reports/zap-report.html"
+          docker cp "$ZAP_CONTAINER:/zap/wrk/zap-report.json" \
+            "${GITHUB_WORKSPACE}/zap-reports/zap-report.json"
+
           test -s "${GITHUB_WORKSPACE}/zap-reports/zap-report.html"
           test -s "${GITHUB_WORKSPACE}/zap-reports/zap-report.json"
+          ls -lh "${GITHUB_WORKSPACE}/zap-reports/"
+
+          # Preserve ZAP's exit status. With -I, passive-scan WARNs do not
+          # fail the job; actual scan/report-generation errors still do.
+          exit "$ZAP_EXIT_CODE"
 
       - name: Summarize ZAP findings in the job summary
         if: always()
