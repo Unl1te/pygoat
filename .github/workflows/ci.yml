@@ -24,6 +24,36 @@ jobs:
       - name: Run Bandit Scan
         run: bandit -ll -ii -r . -f json -o bandit-report.json
 
+      - name: Verify B506 remediation
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = Path("bandit-report.json")
+
+          if not report.exists():
+              raise SystemExit("Bandit report was not generated")
+
+          data = json.loads(report.read_text())
+          findings = data.get("results", [])
+
+          b506 = [
+              finding for finding in findings
+              if finding.get("test_id") == "B506"
+          ]
+
+          print(f"B506 findings after patch: {len(b506)}")
+
+          if b506:
+              for finding in b506:
+                  print(finding["filename"], finding["line_number"])
+              raise SystemExit("B506 finding still exists")
+
+          print("PASS: no B506 findings detected")
+          PY
+
       - name: Upload Bandit report
         if: always()
         uses: actions/upload-artifact@v4
